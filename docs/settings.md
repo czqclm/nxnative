@@ -60,6 +60,22 @@ Shows the frames per second at the top left.
 
 ## Controls
 
+### iPhone Duo custom controls
+
+This fork's iOS front end is shared by every supported game built through the normal IPA workflow. Each app stores its own touch settings; the game's profile, rewritten modules, shaders and RomFS are still supplied separately. No game-specific title or file path is built into the touch editor.
+
+The Chinese launcher selects the display mode and explains the current memory headroom. Touch configuration is edited inside the running game: tap the **gear icon** (⚙). The editor uses the existing runtime pad itself, without presenting a separate preview, changing its frame or scaling it into another canvas. Its movable toolbar floats over the paused game picture and passes touches through everywhere else.
+
+Each of **Outer display**, **Open inner display** and **Folded split** saves independent button positions, sizes, left/right stick sensitivity and dead zones, opacity, and its 2D/3D/Tap preset. Automatic mode follows UIKit's active/inactive division reserved regions on iOS 27.1 and later. Folded mode always places the 16:9 game picture above the controls; it never switches to a left/right arrangement. An active horizontal division supplies the real y boundaries and gap. A vertical division, or a forced folded mode without a usable horizontal division, uses the screen horizontal midpoint. No hinge-angle threshold is guessed.
+
+Tap a visible control or choose it from the toolbar, drag it in place, and use the parameter menu and slider for size, opacity, sensitivity or dead zone. The current 2D/3D/Tap visibility is preserved while editing; Tap has no movable controls. **Reset** changes the current draft only, **Cancel** restores the entry snapshot, and **Save** commits only that profile. A profile or geometry change cancels the draft and shows a notice, preventing edits from being saved to another display. The toolbar can be dragged away from a control it covers.
+
+The guest graphics, audio and clock pause while editing; touches adjust only the draft and are not sent as game input. Going to the background releases held touches but retains the draft. Background and layout pauses are combined so returning to the foreground cannot resume the game while the editor is still open, and closing the editor in the background cannot resume it early. A connected physical controller normally hides touch controls; editing temporarily shows the touch layer and closing it restores the current controller visibility. New controller buttons and phone-shake events are suppressed while editing and are not replayed on exit; legitimate input edges published before entry are preserved.
+
+Sensitivity changes the response curve after the dead zone: values above 1 make small movements stronger, and values below 1 allow finer control. Every value still reaches full input at 80% travel. The Increased Memory Limit entitlement remains in the unsigned IPA's ad-hoc signature for the sideloader to carry forward; it requests a system-determined budget, not a fixed number of gigabytes. RomFS file size is storage, and the host reads its requested ranges rather than loading the whole image at once.
+
+UI-only simulator tests use the production front end with explicitly marked host stubs. They test layout and input behavior but do not run the game binary or establish gameplay performance.
+
 ### Touch feedback
 
 A light tap from the phone when you press an on-screen button.

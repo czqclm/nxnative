@@ -1,2 +1,5 @@
-// The Objective-C functions Launcher.swift calls (CloudSaves.h). project.yml points SWIFT_OBJC_BRIDGING_HEADER here.
+// Objective-C interfaces used by the Swift launcher and display settings.
 #import "CloudSaves.h"
+#import "DmTouchConfig.h"
+#import "DmGamepad.h"
+#import "DmDuoDisplay.h"

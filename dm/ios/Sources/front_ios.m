@@ -1,9 +1,14 @@
-// iOS front end (the iOS implementation of front.h): a centered 16:9 Metal view (black bars on both sides) + a full-screen virtual gamepad layer (DmGamepad.m, controls drawn over the picture).
+// iOS front end: an aspect-fit 16:9 Metal view and a virtual gamepad. Duo's
+// reserved division region separates the picture and controls when folded.
 // The host runs on the big-stack thread started by main.m; front_run runs the guest directly on the calling thread.
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 #import <AVFAudio/AVFAudio.h>
+#import "DmDuoDisplay.h"
+#import "DmTouchConfig.h"
+#import "DmGamepad.h"
+#import "DmLiveTouchEditor.h"
 #include <errno.h>
 #include "front.h"
 #include "hle.h"
@@ -15,15 +20,22 @@
 UIView *dm_gamepad_view(CGRect frame);
 void dm_gamepad_reset(void);
 void dm_gamepad_active(void);
+void dm_gamepad_release_touches(UIView *view);
+void dm_gamepad_set_game_rect(UIView *view, CGRect rect);
 void front_ios_boot(void);
 int front_ios_boot_ok(void);
 const char *front_ios_boot_message(void);   // main.m: why a build that keeps the game files off the IPA found none usable (NULL = the generic hint)
 bool dm_show_launcher(void *view_controller, void (*done)(void));   // Launcher.swift: false = no launcher (no dm/launcher.json, or DM_LAUNCHER=0)
 
 static CAMetalLayer *g_layer;
+static _Atomic double g_brightness = -1;
 static void front_ios_power_watch(void);
 static void front_ios_audio_watch(void);
 static UILabel *front_ios_fps_label(void);
+static void front_ios_audio_apply(void);
+static void front_ios_pause_apply(void);
+static void front_ios_set_layout_editing(BOOL editing);
+static int g_audio_bg, g_audio_intr, g_layout_editing, g_scene_active = 1, g_graphics_paused;
 
 @interface DmGameView : UIView
 @end
@@ -33,7 +45,7 @@ static UILabel *front_ios_fps_label(void);
     if ((self = [super initWithFrame:f])) {
         CAMetalLayer *l = (CAMetalLayer *)self.layer;
         l.device = MTLCreateSystemDefaultDevice(); l.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        l.contentsScale = UIScreen.mainScreen.nativeScale; l.framebufferOnly = NO; l.opaque = YES;
+        l.contentsScale = self.traitCollection.displayScale; l.framebufferOnly = NO; l.opaque = YES;
         self.backgroundColor = UIColor.blackColor;
     }
     return self;
@@ -41,15 +53,26 @@ static UILabel *front_ios_fps_label(void);
 - (void)layoutSubviews {
     [super layoutSubviews];
     CAMetalLayer *l = (CAMetalLayer *)self.layer;
+    UIScreen *screen = self.window.windowScene.screen;
+    CGFloat scale = screen ? screen.nativeScale : self.traitCollection.displayScale;
+    l.contentsScale = scale > 0 ? scale : 1;
     l.drawableSize = CGSizeMake(self.bounds.size.width * l.contentsScale, self.bounds.size.height * l.contentsScale);
 }
+- (void)didMoveToWindow { [super didMoveToWindow]; [self setNeedsLayout]; }
 @end
 
 @interface DmRootVC : UIViewController
 @property (nonatomic, strong) DmGameView *game;
 @property (nonatomic, strong) UIView *pad;
 @property (nonatomic, strong) UILabel *fps;
+@property (nonatomic, strong) UIButton *layoutButton;
+@property (nonatomic, strong) DmLiveTouchEditor *layoutEditor;
+@property (nonatomic, strong) UILabel *layoutNotice;
 @property (nonatomic) BOOL launched;
+@property (nonatomic, strong) id<UIInteraction> hingeInteraction;
+@property (nonatomic) NSInteger lastHingeStatus;
+@property (nonatomic) DmDuoGeometry displayGeometry;
+@property (nonatomic) BOOL hasDisplayGeometry;
 - (void)startGame;
 @end
 static DmRootVC *g_root;
@@ -57,17 +80,105 @@ static void launcher_done(void) { [g_root startGame]; }
 @implementation DmRootVC
 - (void)viewDidLoad {
     [super viewDidLoad];
+    g_root = self;
     self.view.backgroundColor = UIColor.blackColor;
+    // Observe before presenting Launcher: its profile picker must follow the
+    // current display even before the Metal view or gamepad has been created.
+    self.lastHingeStatus = -1;
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(touchSettingsChanged:)
+        name:DmTouchSettingsDidChangeNotification object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(layoutEditingChanged:)
+        name:DmGamepadLayoutEditingDidChangeNotification object:nil];
+    if (@available(iOS 27.1, *)) {
+        __weak DmRootVC *weakSelf = self;
+        self.hingeInteraction = [[UIHingeInteraction alloc] initWithUpdateHandler:
+            ^(UIHingeInteraction *interaction, UIHingeInteractionUpdate *update) {
+                (void)interaction;
+                DmRootVC *self = weakSelf; if (!self) return;
+                NSInteger status = update.hinge ? update.hinge.status : -1;
+                if (status != self.lastHingeStatus) {
+                    self.lastHingeStatus = status;
+                    LOG("front end: hinge status %ld", (long)status);
+                    if (self.pad) dm_gamepad_release_touches(self.pad);
+                }
+                // Region geometry, not a guessed angle threshold, decides layout.
+                [self.view setNeedsLayout];
+            }];
+        [self.view addInteraction:self.hingeInteraction];
+    }
+    [self registerForTraitChanges:@[UITraitHorizontalSizeClass.class, UITraitVerticalSizeClass.class,
+                                   UITraitDisplayScale.class]
+        withHandler:^(DmRootVC *self, UITraitCollection *previous) {
+            (void)previous;
+            if (self.pad) dm_gamepad_release_touches(self.pad);
+            [self.view setNeedsLayout];
+        }];
     front_ios_power_watch();
     if (!front_ios_boot_ok()) {   // No game files: show a hint and do not start the host
         UILabel *lb = [[UILabel alloc] initWithFrame:CGRectInset(self.view.bounds, 40, 40)];
         lb.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         lb.numberOfLines = 0; lb.textAlignment = NSTextAlignmentCenter; lb.textColor = UIColor.whiteColor;
         const char *why = front_ios_boot_message();
-        lb.text = why ? [NSString stringWithFormat:@"Game files unusable.\n%s", why] : @"Game files not found.\nPut the RomFS folder into this App's Documents as \"romfs\" (Files app), then restart.";
+        lb.text = why ? [NSString stringWithFormat:@"游戏数据暂时无法读取。\n%s", why] : @"未找到游戏数据。\n请将 RomFS.img 放入本应用的 Documents 文件夹，再重新打开。";
         [self.view addSubview:lb]; return;
     }
     front_ios_audio_watch();
+}
+- (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
+- (void)touchSettingsChanged:(NSNotification *)notification {
+    (void)notification;
+    if (self.pad) dm_gamepad_release_touches(self.pad);
+    [self.view setNeedsLayout];
+}
+- (void)beginLayoutEditing {
+    if (!self.pad || self.layoutEditor || dm_gamepad_is_layout_editing(self.pad)) return;
+    if (dm_gamepad_begin_layout_edit(self.pad)) {
+        self.layoutEditor = [[DmLiveTouchEditor alloc] initWithPad:self.pad];
+        [self addChildViewController:self.layoutEditor];
+        self.layoutEditor.view.frame = self.view.bounds;
+        self.layoutEditor.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [self.view addSubview:self.layoutEditor.view];
+        [self.layoutEditor didMoveToParentViewController:self];
+        self.layoutButton.hidden = YES;
+        [self.view setNeedsLayout];
+    }
+}
+- (void)layoutEditingChanged:(NSNotification *)notification {
+    if (notification.object != self.pad) return;
+    BOOL editing = [notification.userInfo[@"editing"] boolValue];
+    front_ios_set_layout_editing(editing);
+    if (editing) return;
+    [self.layoutEditor willMoveToParentViewController:nil];
+    [self.layoutEditor.view removeFromSuperview];
+    [self.layoutEditor removeFromParentViewController];
+    self.layoutEditor = nil;
+    self.layoutButton.hidden = NO;
+    NSString *reason = notification.userInfo[@"reason"];
+    if ([reason isEqualToString:@"profileChanged"] || [reason isEqualToString:@"geometryChanged"]) {
+        [self.layoutNotice removeFromSuperview];
+        UILabel *notice = [UILabel new];
+        notice.text = @"屏幕形态已变化，未保存的布局修改已取消";
+        notice.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+        notice.textColor = UIColor.whiteColor; notice.textAlignment = NSTextAlignmentCenter;
+        notice.numberOfLines = 2; notice.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.94];
+        notice.layer.cornerRadius = 10; notice.clipsToBounds = YES; notice.userInteractionEnabled = NO;
+        self.layoutNotice = notice; [self.view addSubview:notice];
+        __weak DmRootVC *weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            DmRootVC *self = weakSelf;
+            if (self.layoutNotice == notice) { [notice removeFromSuperview]; self.layoutNotice = nil; }
+        });
+    }
+    [self.view setNeedsLayout];
+}
+- (void)viewSafeAreaInsetsDidChange {
+    [super viewSafeAreaInsetsDidChange];
+    [self.view setNeedsLayout];
+}
+- (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    if (self.pad) dm_gamepad_release_touches(self.pad);
+    [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
+    [self.view setNeedsLayout];
 }
 // The game view, the pad and the frame-rate counter are made once the launcher has set the switches they read (DM_SHOW_FPS, DM_METAL_HUD); the host's loading began at app launch (main.m)
 - (void)startGame {
@@ -80,30 +191,111 @@ static void launcher_done(void) { [g_root startGame]; }
     if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) { g_layer.developerHUDProperties = @{@"mode": @"default"}; LOG("front end: Metal performance HUD on (DM_METAL_HUD)"); }   // Apple's HUD over the game: frame rate, frame and GPU time, memory
     dm_haptics_apple_init();
     self.pad = dm_gamepad_view(self.view.bounds);
-    self.pad.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    // The controller assigns the pad's region on every geometry change.
+    self.pad.autoresizingMask = UIViewAutoresizingNone;
     [self.view addSubview:self.pad];
     self.fps = front_ios_fps_label();   // above the pad, which hides while a controller is connected
     if (self.fps) [self.view addSubview:self.fps];
+    self.layoutButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButtonConfiguration *button = [UIButtonConfiguration plainButtonConfiguration];
+    button.image = [[UIImage systemImageNamed:@"gearshape"] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    button.preferredSymbolConfigurationForImage = [UIImageSymbolConfiguration configurationWithPointSize:21 weight:UIImageSymbolWeightRegular];
+    button.baseForegroundColor = [UIColor colorWithWhite:1 alpha:0.6];
+    UIBackgroundConfiguration *background = [UIBackgroundConfiguration clearConfiguration];
+    background.backgroundColor = [UIColor colorWithWhite:1 alpha:0.14];
+    background.strokeColor = [UIColor colorWithWhite:1 alpha:0.38];
+    background.strokeWidth = 1.5;
+    button.background = background;
+    button.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+    button.contentInsets = NSDirectionalEdgeInsetsMake(10, 10, 10, 10);
+    self.layoutButton.configuration = button;
+    self.layoutButton.configurationUpdateHandler = ^(UIButton *control) {
+        UIButtonConfiguration *configuration = control.configuration;
+        UIBackgroundConfiguration *fill = configuration.background;
+        fill.backgroundColor = [UIColor colorWithWhite:1 alpha:control.highlighted ? 0.45 : 0.14];
+        configuration.background = fill;
+        configuration.baseForegroundColor = [UIColor colorWithWhite:control.highlighted ? 0 : 1 alpha:control.highlighted ? 0.7 : 0.6];
+        control.configuration = configuration;
+    };
+    self.layoutButton.layer.shadowColor = UIColor.blackColor.CGColor;
+    self.layoutButton.layer.shadowOpacity = 0.2;
+    self.layoutButton.layer.shadowRadius = 3;
+    self.layoutButton.layer.shadowOffset = CGSizeMake(0, 1);
+    self.layoutButton.accessibilityLabel = @"Layout";
+    self.layoutButton.accessibilityIdentifier = @"live.layout.open";
+    [self.layoutButton addTarget:self action:@selector(beginLayoutEditing) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.layoutButton];
     [self.view setNeedsLayout]; [self.view layoutIfNeeded];
     UIApplication.sharedApplication.idleTimerDisabled = YES;
     front_ios_boot();
 }
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    CGRect b = self.view.bounds; if (!self.game) return;
-    CGFloat w = b.size.width, h = b.size.height;   // Fit 16:9 into the whole screen
-    if (w / h > 16.0 / 9.0) w = h * 16.0 / 9.0; else h = w * 9.0 / 16.0;
-    self.game.frame = CGRectMake(floor((b.size.width - w) / 2), floor((b.size.height - h) / 2), w, h);
+    CGRect b = self.view.bounds, division = CGRectNull;
+    UIScreen *currentScreen = self.view.window.windowScene.screen;
+    if (currentScreen) g_brightness = currentScreen.brightness;
+    BOOL hasDivision = NO, activeDivision = NO;
+    if (@available(iOS 27.1, *)) {
+        NSArray<UIViewReservedRegion *> *regions = [self.view
+            reservedRegionsOfKind:UIViewReservedRegionKind.divisionRegionKind
+            options:UIViewReservedRegionQueryOptionsIncludeInactive];
+        hasDivision = regions.count > 0;
+        for (UIViewReservedRegion *region in regions) {
+            if (region.isActive && !CGRectIsEmpty(CGRectIntersection(b, region.frame))) {
+                activeDivision = YES; division = region.frame; break;
+            }
+        }
+    }
+    NSString *mode = [NSUserDefaults.standardUserDefaults stringForKey:@"DmTouchDisplayMode"];
+    NSString *profile = dm_duo_resolve_profile(mode, hasDivision, activeDivision,
+        self.traitCollection.horizontalSizeClass, self.traitCollection.verticalSizeClass);
+    DmDuoGeometry layout = dm_duo_geometry(b, self.view.safeAreaInsets,
+        [profile isEqualToString:@"folded"], division, activeDivision);
+    BOOL geometryChanged = !self.hasDisplayGeometry
+        || !CGRectEqualToRect(layout.gameFrame, self.displayGeometry.gameFrame)
+        || !CGRectEqualToRect(layout.padFrame, self.displayGeometry.padFrame)
+        || layout.axis != self.displayGeometry.axis;
+    if (geometryChanged && self.pad) dm_gamepad_release_touches(self.pad);
+    self.displayGeometry = layout; self.hasDisplayGeometry = YES;
+    if (self.view.window) { // A full-screen launcher may have detached this hierarchy.
+        dm_touch_set_active_profile(profile);
+        dm_duo_publish_layout(profile, layout);
+    }
+    if (!self.game) return;
+    self.game.frame = layout.gameFrame;
+    [self.game setNeedsLayout];   // The scene's display scale can change without a bounds change.
+    self.pad.frame = layout.padFrame;
+    dm_gamepad_set_game_rect(self.pad, layout.gameFrame);
+    CGRect controlsSafe = CGRectIntersection(layout.padFrame, UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets));
+    if (CGRectIsNull(controlsSafe) || CGRectIsInfinite(controlsSafe) || CGRectIsEmpty(controlsSafe))
+        controlsSafe = CGRectIsEmpty(layout.padFrame) || CGRectIsNull(layout.padFrame) ? CGRectZero : layout.padFrame;
+    CGFloat bw = MIN(44, controlsSafe.size.width), bh = MIN(44, controlsSafe.size.height);
+    CGFloat by = MIN(CGRectGetMinY(controlsSafe) + 56, CGRectGetMaxY(controlsSafe) - bh);
+    self.layoutButton.frame = CGRectMake(CGRectGetMidX(controlsSafe) - bw / 2, by, bw, bh);
+    self.layoutButton.alpha = [dm_touch_profile_settings(dm_touch_active_profile())[@"opacity"] doubleValue];
+    self.layoutButton.hidden = self.layoutEditor != nil || bw < 1 || bh < 1;
+    if (self.layoutEditor) {
+        self.layoutEditor.view.frame = b;
+        [self.layoutEditor layoutInBounds:b safeInsets:self.view.safeAreaInsets preferredRegion:layout.gameFrame];
+    }
+    if (self.layoutNotice) {
+        CGFloat width = MIN(330, controlsSafe.size.width);
+        self.layoutNotice.frame = CGRectMake(CGRectGetMidX(controlsSafe) - width / 2, by + bh + 6, width, 44);
+    }
     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
-        CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets); CGFloat u = MIN(b.size.height / 430.0, 1.3);
-        self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), 64, 22);
+        CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets);
+        CGFloat u = MIN(layout.padFrame.size.height / 430.0, 1.3);
+        CGFloat x = layout.split ? CGRectGetMinX(layout.gameFrame) + 8 : CGRectGetMinX(s) + 130 * u;
+        CGFloat y = layout.split ? CGRectGetMinY(layout.gameFrame) + 8 : CGRectGetMinY(s) + 22 * u - 11;
+        self.fps.frame = CGRectMake(floor(x), floor(y), 64, 22);
     }
 }
 - (void)viewDidAppear:(BOOL)a {
     [super viewDidAppear:a];
+    [self.view setNeedsLayout]; [self.view layoutIfNeeded];
     if (!front_ios_boot_ok() && front_ios_boot_message() && !self.presentedViewController) {   // a slim build whose game file image is missing or another version (main.m)
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Game files" message:@(front_ios_boot_message()) preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"游戏数据" message:@(front_ios_boot_message()) preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:a animated:YES completion:nil];
     }
     if (self.launched || !front_ios_boot_ok()) return;
@@ -113,19 +305,22 @@ static void launcher_done(void) { [g_root startGame]; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }   // Edge gestures need two swipes, to avoid accidental exits
 - (BOOL)prefersStatusBarHidden { return YES; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAllButUpsideDown; }
 @end
 UIViewController *front_ios_root(void) { return [DmRootVC new]; }
 
 // Thermal state and screen brightness for the power and present rows every 300 frames (hle_nvn.c; its weak defaults return -1 on the Mac). thermalState: 0 nominal, 1 fair, 2 serious, 3 critical.
 // Brightness is read on the main thread at start and on each change; every change of the thermal state and of Low Power Mode (which lowers the CPU clock) is logged with the time since launch
-static _Atomic double g_brightness = -1;
 int dm_thermal_now(void) { return (int)NSProcessInfo.processInfo.thermalState; }
 int dm_low_power_now(void) { return NSProcessInfo.processInfo.lowPowerModeEnabled; }   // the frame step does not probe in it (hle_nvn.c fstep_cpu_slowed)
 double dm_brightness_now(void) { return g_brightness; }
 static void front_ios_power_watch(void) {
-    g_brightness = UIScreen.mainScreen.brightness;
-    [NSNotificationCenter.defaultCenter addObserverForName:UIScreenBrightnessDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; g_brightness = UIScreen.mainScreen.brightness; }];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIScreenBrightnessDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+        UIViewController *visible = g_root;
+        while (visible.presentedViewController) visible = visible.presentedViewController;
+        UIScreen *screen = visible.viewIfLoaded.window.windowScene.screen;
+        if (screen && n.object == screen) g_brightness = screen.brightness;
+    }];
     [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
         (void)n; LOG("front end: thermal state → %d (%.0f s after launch)", dm_thermal_now(), (now_ns() - g_t0_ns) / 1e9); }];
     [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
@@ -243,8 +438,26 @@ void front_ios_audio_session(void) {
 // Real audio output is suspended (the silent sink paces the game) while the app is in the background or another audio session has interrupted ours (Siri, an alarm, a call).
 // Without the interruption observer the AudioUnits stayed "started" while iOS no longer called them, and a game waiting for its buffers back lost its sound until restart.
 // All of this runs on the main queue, like the scene callbacks
-static int g_audio_bg, g_audio_intr;
-static void front_ios_audio_apply(void) { dm_audio_suspend(g_audio_bg || g_audio_intr); }
+static void front_ios_audio_apply(void) { dm_audio_suspend(g_audio_bg || g_audio_intr || g_layout_editing); }
+
+// The graphics gate and guest-clock wait are shared by backgrounding and live
+// layout editing. Clearing one reason must not resume while the other still holds.
+// Reason 1 also blocks guest clock reads, avoiding a zero-time busy loop.
+static void front_ios_pause_apply(void) {
+    int paused = g_audio_bg || g_layout_editing;
+    if (paused == g_graphics_paused) return;
+    g_graphics_paused = paused;
+    if (paused) { guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); }
+    else { dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); }
+}
+static void front_ios_set_layout_editing(BOOL editing) {
+    g_layout_editing = editing;
+    if (editing) dm_focus_set(g_audio_bg ? 3 : 2);
+    front_ios_audio_apply();
+    front_ios_pause_apply();
+    if (!editing) dm_focus_set(g_audio_bg ? 3 : (g_scene_active ? 1 : 2));
+    LOG("front end: live layout editing %s", editing ? "began" : "ended");
+}
 static void front_ios_audio_watch(void) {
     NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
     [nc addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
@@ -279,13 +492,14 @@ static void save_sync_background(void) {
 void front_ios_focus_event(int ev) {
     if (!g_layer) return;
     switch (ev) {
-        case 0: dm_gamepad_reset(); dm_focus_set(2); break;
-        case 1: UIApplication.sharedApplication.idleTimerDisabled = NO; dm_focus_set(3); g_audio_bg = 1; front_ios_audio_apply(); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); save_sync_background(); break;
-        case 2: dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); front_ios_audio_session(); g_audio_bg = 0; front_ios_audio_apply(); dm_focus_set(2); break;
+        case 0: g_scene_active = 0; dm_gamepad_reset(); dm_focus_set(2); break;
+        case 1: UIApplication.sharedApplication.idleTimerDisabled = NO; dm_focus_set(3); g_audio_bg = 1; front_ios_audio_apply(); front_ios_pause_apply(); save_sync_background(); break;
+        case 2: g_audio_bg = 0; front_ios_pause_apply(); front_ios_audio_session(); front_ios_audio_apply(); dm_focus_set(2); break;
         case 3:   // Becoming active again also ends an interruption whose "ended" never came (not every one sends it), and retries a session that would not activate on the way back
+            g_scene_active = 1;
             UIApplication.sharedApplication.idleTimerDisabled = YES;
             if (g_audio_intr) { LOG("audio session: active again with no interruption-ended notice; resuming"); g_audio_intr = 0; g_session_off = 1; }
             if (g_session_off) front_ios_audio_session();
-            front_ios_audio_apply(); dm_gamepad_active(); dm_focus_set(1); break;
+            front_ios_audio_apply(); dm_gamepad_active(); dm_focus_set(g_layout_editing ? 2 : 1); break;
     }
 }

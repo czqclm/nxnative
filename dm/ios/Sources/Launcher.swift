@@ -21,30 +21,30 @@ private struct CloudSavesSection: View {
     var body: some View {
         Section {
             HStack {
-                Text("Cloud saves")
+                Text("云存档")
                 Spacer()
-                Text(folder.isEmpty ? "Off" : (folder as NSString).lastPathComponent)
+                Text(folder.isEmpty ? "关闭" : (folder as NSString).lastPathComponent)
                     .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
-            Button(folder.isEmpty ? "Choose a folder in iCloud Drive…" : "Choose a different folder…") { picking = true }
+            Button(folder.isEmpty ? "选择 iCloud 云盘文件夹…" : "选择其他文件夹…") { picking = true }
             if !folder.isEmpty {
-                Button("Turn off cloud saves", role: .destructive) {
+                Button("关闭云存档", role: .destructive) {
                     dm_clear_cloud_saves(); refresh(); note = ""
                 }
             }
         } footer: {
             Text(note.isEmpty
-                 ? "Choose a folder in iCloud Drive, and the same one in the Mac app's Cloud saves. The save comes in when the game starts and goes out after each save; a save that is replaced is kept in save-backups."
+                 ? "在 iCloud 云盘中选择一个文件夹，并在 Mac 应用的云存档设置中选择同一文件夹。游戏启动时导入云端存档，每次保存后同步到该文件夹；被替换的存档会保留在 save-backups 中。"
                  : note)
         }
         .sheet(isPresented: $picking) {
             DocumentPicker(types: [.folder]) { url in
                 picking = false
                 if dm_store_cloud_saves(url) {
-                    note = "Saved. The game uses this folder when you press Play."
+                    note = "已保存。点击“开始游戏”后将使用此文件夹。"
                     refresh()
                 } else {
-                    note = "That folder could not be remembered — try a different one."
+                    note = "无法记住所选文件夹，请尝试选择其他文件夹。"
                 }
             } onCancel: { picking = false }
         }
@@ -55,7 +55,7 @@ private struct CloudSavesSection: View {
         var stale: ObjCBool = false
         folder = dm_cloud_saves_path(&stale) ?? ""
         if stale.boolValue && folder.isEmpty {
-            note = "The folder you chose before is no longer readable (the app was signed differently). Please choose it again."
+            note = "之前选择的文件夹已无法访问（应用签名已变更）。请重新选择。"
         }
     }
 }
@@ -95,54 +95,93 @@ private struct LauncherView: View {
     @ObservedObject var m: LauncherModel
     let play: () -> Void
     @State private var memory = os_proc_available_memory()
+    @State private var resetConfirm = false
+
+    private var gameName: String { (info("CFBundleDisplayName") as? String) ?? "游戏" }
+
+    private var settingsList: some View {
+        List {
+            DuoDisplaySection()
+            ForEach(m.sections, id: \.self) { section in
+                let rows = m.rows(in: section)
+                if !rows.isEmpty {
+                    Section(launcherText(section)) {
+                        ForEach(rows) { SettingRow(s: $0, m: m) }
+                    }
+                }
+            }
+            Section {
+                Button("恢复游戏默认设置") { resetConfirm = true }
+                    .disabled(!m.changed)
+            } footer: {
+                Text("恢复本游戏的启动选项。触控布局请进入游戏后，点 ⚙ 单独调整。")
+            }
+            CloudSavesSection()
+            Section {
+                HStack {
+                    Text("应用可用内存")
+                    Spacer()
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory))
+                        .monospacedDigit().foregroundStyle(.secondary)
+                }
+            } footer: {
+                Text("这是应用当前还可使用的内存额度，由 iOS 动态管理，与游戏文件大小不同。")
+            }
+        }
+        .listStyle(.insetGrouped)
+        .contentMargins(.horizontal, 12, for: .scrollContent)
+    }
+
+    private func summary(compact: Bool) -> some View {
+        VStack(spacing: compact ? 10 : 20) {
+            if compact {
+                HStack(spacing: 12) {
+                    if let icon = appIcon() {
+                        Image(uiImage: icon).resizable().frame(width: 52, height: 52)
+                            .clipShape(RoundedRectangle(cornerRadius: 12)).accessibilityHidden(true)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(gameName).font(.headline).lineLimit(2)
+                        Text("版本 \((info("CFBundleShortVersionString") as? String) ?? "") · Duo 触控版")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                }
+            } else {
+                if let icon = appIcon() {
+                    Image(uiImage: icon).resizable().frame(width: 96, height: 96)
+                        .clipShape(RoundedRectangle(cornerRadius: 22)).accessibilityHidden(true)
+                }
+                Text(gameName).font(.title2.weight(.bold)).multilineTextAlignment(.center)
+                Text("版本 \((info("CFBundleShortVersionString") as? String) ?? "")")
+                    .font(.callout).foregroundStyle(.secondary)
+                Text("iPhone Duo 触控版").font(.caption).foregroundStyle(.secondary)
+            }
+            playButton
+        }
+        .padding(compact ? 16 : 24)
+    }
 
     var body: some View {
         GeometryReader { geometry in
-            HStack(spacing: 0) {
-                VStack(spacing: 16) {
-                    if let icon = appIcon() {
-                        Image(uiImage: icon).resizable().frame(width: 96, height: 96)
-                            .clipShape(RoundedRectangle(cornerRadius: 22))
-                            .accessibilityHidden(true)
-                    }
-                    Text((info("CFBundleDisplayName") as? String) ?? "Game")
-                        .font(.title.weight(.bold)).multilineTextAlignment(.center)
-                    Text("Version \((info("CFBundleShortVersionString") as? String) ?? "")")
-                        .font(.callout).foregroundStyle(.secondary)
-                    playButton
+            if geometry.size.width >= 780 && geometry.size.width > geometry.size.height {
+                HStack(spacing: 0) {
+                    summary(compact: false).frame(width: min(geometry.size.width * 0.32, 360))
+                    settingsList
                 }
-                .padding(16)
-                .frame(width: geometry.size.width / 3, height: geometry.size.height)
-                List {
-                    ForEach(m.sections, id: \.self) { section in
-                        let rows = m.rows(in: section)
-                        if !rows.isEmpty {
-                            Section(section) {
-                                ForEach(rows) { SettingRow(s: $0, m: m) }
-                            }
-                        }
-                    }
-                    Section {
-                        Button("Reset to tested defaults") { m.reset() }
-                            .disabled(!m.changed)
-                    } footer: {
-                        Text("Brings back all settings this game was tested with.")
-                    }
-                    CloudSavesSection()
-                    Section {
-                        HStack {
-                            Text("Memory available")
-                            Spacer()
-                            Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
-                        }
-                    }
+            } else {
+                VStack(spacing: 0) {
+                    summary(compact: true)
+                    settingsList
                 }
-                .listStyle(.insetGrouped)
-                .contentMargins(.horizontal, 12, for: .scrollContent)
-                .frame(width: geometry.size.width * 2 / 3)
             }
         }
+        .background(DuoLayoutObserver().ignoresSafeArea())
         .preferredColorScheme(.dark)
+        .confirmationDialog("恢复本游戏的启动选项？", isPresented: $resetConfirm, titleVisibility: .visible) {
+            Button("恢复默认", role: .destructive) { m.reset() }
+            Button("取消", role: .cancel) {}
+        }
         .task {
             while !Task.isCancelled {
                 memory = os_proc_available_memory()
@@ -152,7 +191,8 @@ private struct LauncherView: View {
     }
 
     @ViewBuilder var playButton: some View {
-        let button = Button(action: play) { Text("Play").font(.title3.weight(.semibold)).frame(maxWidth: 220) }.controlSize(.large)
+        let button = Button(action: play) { Text("开始游戏").font(.title3.weight(.semibold)).frame(maxWidth: 220) }
+            .controlSize(.large).accessibilityIdentifier("launcher.play")
         if #available(iOS 26.0, *) { button.buttonStyle(.glassProminent) } else { button.buttonStyle(.borderedProminent) }
     }
 
