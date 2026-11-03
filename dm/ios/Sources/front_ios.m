@@ -1,5 +1,6 @@
-// iOS front end: an aspect-fit 16:9 Metal view and a virtual gamepad.
-// Portrait places controls below the picture; landscape keeps the full overlay.
+// iOS front end: one geometry policy for the 16:9 picture and per-profile controls.
+// Portrait separates picture and controls; landscape overlays them, with optional Fill.
+// A TV owns the same Metal view while the phone becomes a full-screen controller.
 // The host runs on the big-stack thread started by main.m; front_run runs the guest directly on the calling thread.
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -21,14 +22,14 @@
 #include "save_sync.h"
 #import "CloudSaves.h"
 
-UIView *dm_gamepad_view(CGRect frame);
-void dm_gamepad_reset(void);
 void dm_gamepad_active(void);
-void dm_gamepad_release_touches(UIView *view);
-void dm_gamepad_set_game_rect(UIView *view, CGRect rect);
+#import "DmLayout.h"
+#import "DmGameMenu.h"
+
 void front_ios_boot(void);
 int front_ios_boot_ok(void);
 const char *front_ios_boot_message(void);   // main.m: why a build that keeps the game files off the IPA found none usable (NULL = the generic hint)
+const char *front_ios_device_check(void);   // main.m: why this device cannot run the games (its GPU has no BC textures; NULL = supported); makes the first Metal device
 bool dm_show_launcher(void *view_controller, void (*done)(void));   // Launcher.swift: false = no launcher (no dm/launcher.json, or DM_LAUNCHER=0)
 
 static CAMetalLayer *g_layer;
@@ -42,27 +43,50 @@ static void front_ios_set_layout_editing(BOOL editing);
 static int g_audio_bg, g_audio_intr, g_layout_editing, g_scene_active = 1, g_graphics_paused;
 
 @interface DmGameView : UIView
+@property (nonatomic) CGFloat maxPixelWidth;   // 0: the screen's own pixels; a TV caps the drawable at 1920 across (tv_attach)
 @end
 @implementation DmGameView
 + (Class)layerClass { return CAMetalLayer.class; }
 - (instancetype)initWithFrame:(CGRect)f {
     if ((self = [super initWithFrame:f])) {
+        [self registerForTraitChanges:@[UITraitDisplayScale.class] withHandler:^(id<UITraitEnvironment> environment, UITraitCollection *previous) {
+            [(UIView *)environment setNeedsLayout];
+        }];
         CAMetalLayer *l = (CAMetalLayer *)self.layer;
         l.device = MTLCreateSystemDefaultDevice(); l.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        l.contentsScale = self.traitCollection.displayScale; l.framebufferOnly = NO; l.opaque = YES;
+        l.contentsScale = MAX(self.traitCollection.displayScale, 1); l.framebufferOnly = NO; l.opaque = YES;
         self.backgroundColor = UIColor.blackColor;
     }
     return self;
 }
-- (void)layoutSubviews {
+- (void)didMoveToWindow { [super didMoveToWindow]; [self setNeedsLayout]; }   // the phone's screen or a TV's (DmTVSceneDelegate)
+- (void)layoutSubviews {   // render at the pixels of the screen the view is on (an iPad window can move to another), at most maxPixelWidth across
     [super layoutSubviews];
     CAMetalLayer *l = (CAMetalLayer *)self.layer;
     UIScreen *screen = self.window.windowScene.screen;
-    CGFloat scale = screen ? screen.nativeScale : self.traitCollection.displayScale;
-    l.contentsScale = scale > 0 ? scale : 1;
+    CGFloat scale = screen ? screen.nativeScale : MAX(self.traitCollection.displayScale, 1);
+    if (self.maxPixelWidth > 0) scale = MIN(scale, self.maxPixelWidth / MAX(self.bounds.size.width, 1));
+    l.contentsScale = scale;
     l.drawableSize = CGSizeMake(self.bounds.size.width * l.contentsScale, self.bounds.size.height * l.contentsScale);
 }
-- (void)didMoveToWindow { [super didMoveToWindow]; [self setNeedsLayout]; }
+@end
+static UIWindow *g_tv; static int g_tv_mode_was = -1;
+static void tv_attach(void);
+
+@interface DmRootView : UIView
+@end
+@implementation DmRootView
++ (BOOL)requiresConstraintBasedLayout { return YES; }
+- (void)updateConstraints {
+#if __has_include(<UIKit/UIHingeInteraction.h>)
+    if (@available(iOS 27.1, *)) {
+        // Reading here registers UIKit's automatic reserved-region invalidation.
+        [self reservedRegionsOfKind:UIViewReservedRegionKind.divisionRegionKind options:UIViewReservedRegionQueryOptionsIncludeInactive];
+        [self setNeedsLayout];
+    }
+#endif
+    [super updateConstraints];
+}
 @end
 
 @interface DmRootVC : UIViewController
@@ -82,10 +106,26 @@ static int g_audio_bg, g_audio_intr, g_layout_editing, g_scene_active = 1, g_gra
 @property (nonatomic) BOOL hasDisplayGeometry;
 - (void)startGame;
 - (void)updateHingeStatus:(NSInteger)status angle:(CGFloat)angleRadians;
+@property (nonatomic, strong) id tv;   // The registered external scene accessory (iOS 27).
+@property (nonatomic) BOOL fill;          // Fill only crops the landscape overlay; portrait stays fitted.
+@property (nonatomic, copy) NSString *layoutLog;
+@property (nonatomic, readonly) NSInteger hingeStatus;
+@property (nonatomic, readonly) BOOL partiallyOpen;
+#if __has_include(<UIKit/UIHingeInteraction.h>)
+- (void)hingeChanged:(UIHinge *)hinge API_AVAILABLE(ios(27.1));
+#endif
+- (void)showFPS:(BOOL)on;
 @end
 static DmRootVC *g_root;
 static void launcher_done(void) { [g_root startGame]; }
 @implementation DmRootVC
+- (void)loadView { self.view = [DmRootView new]; }
+- (void)showHint:(NSString *)text {   // why the game cannot start, centered over the black screen
+    UILabel *lb = [[UILabel alloc] initWithFrame:CGRectInset(self.view.bounds, 40, 40)];
+    lb.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    lb.numberOfLines = 0; lb.textAlignment = NSTextAlignmentCenter; lb.textColor = UIColor.whiteColor;
+    lb.text = text; [self.view addSubview:lb];
+}
 - (void)viewDidLoad {
     [super viewDidLoad];
     g_root = self;
@@ -101,17 +141,18 @@ static void launcher_done(void) { [g_root startGame]; }
         name:DmGamepadLayoutEditingDidChangeNotification object:nil];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(controlReflectionChanged:)
         name:DmControlReflectionDidChangeNotification object:nil];
+#if __has_include(<UIKit/UIHingeInteraction.h>)
     if (@available(iOS 27.1, *)) {
         __weak DmRootVC *weakSelf = self;
         self.hingeInteraction = [[UIHingeInteraction alloc] initWithUpdateHandler:
             ^(UIHingeInteraction *interaction, UIHingeInteractionUpdate *update) {
                 (void)interaction;
                 DmRootVC *self = weakSelf; if (!self) return;
-                UIHinge *hinge = update.hinge;
-                [self updateHingeStatus:hinge ? hinge.status : -1 angle:hinge ? hinge.angle : NAN];
+                [self hingeChanged:update.hinge];
             }];
         [self.view addInteraction:self.hingeInteraction];
     }
+#endif
     [self registerForTraitChanges:@[UITraitHorizontalSizeClass.class, UITraitVerticalSizeClass.class,
                                    UITraitDisplayScale.class]
         withHandler:^(DmRootVC *self, UITraitCollection *previous) {
@@ -121,16 +162,32 @@ static void launcher_done(void) { [g_root startGame]; }
         }];
     front_ios_power_watch();
     if (!front_ios_boot_ok()) {   // No game files: show a hint and do not start the host
-        UILabel *lb = [[UILabel alloc] initWithFrame:CGRectInset(self.view.bounds, 40, 40)];
-        lb.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        lb.numberOfLines = 0; lb.textAlignment = NSTextAlignmentCenter; lb.textColor = UIColor.whiteColor;
         const char *why = front_ios_boot_message();
-        lb.text = why ? [NSString stringWithFormat:@"游戏数据暂时无法读取。\n%s", why] : @"未找到游戏数据。\n请将 RomFS.img 放入本应用的 Documents 文件夹，再重新打开。";
-        [self.view addSubview:lb]; return;
+        [self showHint:why ? [NSString stringWithFormat:@"游戏数据暂时无法读取。\n%s", why] : @"未找到游戏数据。\n请将 RomFS.img 放入本应用的 Documents 文件夹，再重新打开。"]; return;
     }
     front_ios_audio_watch();
+#if defined(__IPHONE_27_0)   // compiled only with an SDK that has the scene accessory API
+    if (@available(iOS 27.0, *)) {   // iOS 27 offers a TV scene only to a registered scene accessory, no longer from the Info.plist entry alone (that path stays for iOS 26)
+        UISceneConfiguration *c = [[UISceneConfiguration alloc] initWithName:@"TV" sessionRole:UIWindowSceneSessionRoleExternalDisplayNonInteractive];
+        c.delegateClass = NSClassFromString(@"DmTVSceneDelegate");
+        self.tv = [self registerSceneAccessory:[UISceneAccessory externalNonInteractiveSceneAccessoryWithConfiguration:c]];
+    }
+#endif
 }
 - (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
+- (NSInteger)hingeStatus { return MAX(0, self.lastHingeStatus); }
+- (BOOL)partiallyOpen {
+#if __has_include(<UIKit/UIHingeInteraction.h>)
+    if (@available(iOS 27.1, *)) return self.lastHingeStatus == UIHingeStatusPartiallyOpen;
+#endif
+    return NO;
+}
+#if __has_include(<UIKit/UIHingeInteraction.h>)
+- (void)hingeChanged:(UIHinge *)hinge API_AVAILABLE(ios(27.1)) {
+    [self updateHingeStatus:hinge ? hinge.status : UIHingeStatusUnknown
+                     angle:hinge ? hinge.angle : NAN];
+}
+#endif
 - (void)updateHingeStatus:(NSInteger)status angle:(CGFloat)angleRadians {
     if (!NSThread.isMainThread) {
         dispatch_async(dispatch_get_main_queue(), ^{ [self updateHingeStatus:status angle:angleRadians]; });
@@ -143,6 +200,7 @@ static void launcher_done(void) { [g_root startGame]; }
     self.lastHingeAngle = isfinite(angleRadians) ? angleRadians : NAN;
     // A visual update must not publish touch settings, release held input,
     // discard an editor draft, or change either owner of the game's pause.
+    [self.view setNeedsUpdateConstraints];
     [self.view setNeedsLayout];
 }
 - (void)touchSettingsChanged:(NSNotification *)notification {
@@ -218,7 +276,12 @@ static void launcher_done(void) { [g_root startGame]; }
 - (void)startGame {
     if (self.game) return;
     dm_cloud_saves_env();   // DM_SAVE_SYNC from the launcher's Cloud saves pick, before the game's first save mount reads it (CloudSaves.m, save_sync.h)
-    front_hud_env();   // before the game view makes its device (an env file's DM_METAL_HUD sets it in main.m already)
+    front_hud_env();   // before the process's first Metal device, which reads MTL_HUD_ENABLED (an env file's DM_METAL_HUD sets it in main.m already; GitHub issue #840)
+    const char *dev = front_ios_device_check();   // that first device: a GPU without BC textures is refused here, not at launch, so the launcher's HUD switch counts
+    if (dev) { [self showHint:[NSString stringWithFormat:@"此设备暂不支持运行游戏。\n%s", dev]]; return; }   // the host does not start
+    self.fill = dm_picture_fill(getenv("DM_PICTURE_FIT"));
+    if (self.fill) LOG("front end: picture Fill (DM_PICTURE_FIT=fill), the 16:9 picture covers the screen in landscape and its edges are cropped");
+    self.view.clipsToBounds = YES;   // with Fill the game view is larger than the screen
     self.game = [[DmGameView alloc] initWithFrame:self.view.bounds];
     [self.view addSubview:self.game];
     self.controlReflection = [[DmControlReflection alloc] initWithRootView:self.view gameView:self.game];
@@ -229,9 +292,11 @@ static void launcher_done(void) { [g_root startGame]; }
     // The controller assigns the pad's region on every geometry change.
     self.pad.autoresizingMask = UIViewAutoresizingNone;
     [self.view addSubview:self.pad];
-    self.fps = front_ios_fps_label();   // above the pad, which hides while a controller is connected
-    if (self.fps) [self.view addSubview:self.fps];
-    self.layoutButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    dm_gamepad_set_menu_visible(self.pad, NO);   // One gear: tap edits in place; long-press opens the live menu.
+    const char *fps = getenv("DM_SHOW_FPS");
+    [self showFPS:fps ? atoi(fps) != 0 : [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMShowFPS"] boolValue]];
+    self.layoutButton = dm_game_menu_button();
+    self.layoutButton.showsMenuAsPrimaryAction = NO;
     UIButtonConfiguration *button = [UIButtonConfiguration plainButtonConfiguration];
     button.image = [[UIImage systemImageNamed:@"gearshape"] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
     button.preferredSymbolConfigurationForImage = [UIImageSymbolConfiguration configurationWithPointSize:21 weight:UIImageSymbolWeightRegular];
@@ -256,12 +321,14 @@ static void launcher_done(void) { [g_root startGame]; }
     self.layoutButton.layer.shadowOpacity = 0.2;
     self.layoutButton.layer.shadowRadius = 3;
     self.layoutButton.layer.shadowOffset = CGSizeMake(0, 1);
-    self.layoutButton.accessibilityLabel = @"Layout";
+    self.layoutButton.accessibilityLabel = @"按键与倒影设置";
+    self.layoutButton.accessibilityHint = @"轻点编辑，长按打开游戏菜单";
     self.layoutButton.accessibilityIdentifier = @"live.layout.open";
     [self.layoutButton addTarget:self action:@selector(beginLayoutEditing) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.layoutButton];
     [self.view setNeedsLayout]; [self.view layoutIfNeeded];
     UIApplication.sharedApplication.idleTimerDisabled = YES;
+    tv_attach();   // a TV connected while the launcher showed
     front_ios_boot();
 }
 - (void)viewDidLayoutSubviews {
@@ -272,6 +339,12 @@ static void launcher_done(void) { [g_root startGame]; }
     NSString *mode = [NSUserDefaults.standardUserDefaults stringForKey:@"DmTouchDisplayMode"];
     NSString *profile;
     DmDuoGeometry layout = dm_duo_layout_for_view(self.view, mode, &profile);
+    BOOL onTV = g_tv && self.game && self.game.superview == g_tv.rootViewController.view;
+    if (onTV) {
+        layout = (DmDuoGeometry){ .padFrame = b, .axis = DmDuoSplitAxisNone };
+    } else if (self.fill && !layout.split && !CGRectIsEmpty(b)) {
+        layout.gameFrame = dm_aspect_fill(b);
+    }
     BOOL geometryChanged = !self.hasDisplayGeometry
         || !CGRectEqualToRect(layout.gameFrame, self.displayGeometry.gameFrame)
         || !CGRectEqualToRect(layout.padFrame, self.displayGeometry.padFrame)
@@ -283,15 +356,29 @@ static void launcher_done(void) { [g_root startGame]; }
         dm_duo_publish_layout(profile, layout);
     }
     if (!self.game) return;
-    BOOL partiallyOpen = NO;
-    if (@available(iOS 27.1, *)) partiallyOpen = self.lastHingeStatus == UIHingeStatusPartiallyOpen;
-    DmReflectionStyle reflectionStyle = dm_reflection_configured_style(self.reflectionPreferences.currentSettings,
-        layout.split && [profile isEqualToString:@"folded"], partiallyOpen, self.lastHingeAngle);
-    [self.controlReflection updateWithBounds:b gameFrame:layout.gameFrame controlFrame:layout.padFrame
-                                      style:reflectionStyle];
+    if (onTV) {
+        // attach already restored the original view before moving it. Do not
+        // call updateWithBounds here: that method assigns the phone's game frame.
+        [self.controlReflection disable];
+    } else {
+        DmReflectionStyle reflectionStyle = dm_reflection_configured_style(self.reflectionPreferences.currentSettings,
+            layout.split && [profile isEqualToString:@"folded"], self.partiallyOpen, self.lastHingeAngle);
+        [self.controlReflection updateWithBounds:b gameFrame:layout.gameFrame controlFrame:layout.padFrame
+                                          style:reflectionStyle];
+    }
     [self.game setNeedsLayout];   // The scene's display scale can change without a bounds change.
     self.pad.frame = layout.padFrame;
+    // The pad's custom positions are normalized to its own bounds, including
+    // the lower portrait panel. Arrange receives that same local coordinate space;
+    // the explicit touch rectangle remains in the parent's coordinates.
+    CGRect localGame = onTV ? CGRectZero : [self.pad convertRect:layout.gameFrame fromView:self.view];
+    DmLayout padLayout = { localGame, self.pad.bounds, layout.split, NO };
+    dm_gamepad_arrange(self.pad, padLayout);
     dm_gamepad_set_game_rect(self.pad, layout.gameFrame);
+    NSString *line = [NSString stringWithFormat:@"%@, profile %@, hinge %ld, picture %@, controls %@",
+        onTV ? @"pad only (picture on the TV)" : layout.split ? @"split" : self.fill ? @"overlay, Fill" : @"overlay",
+        profile, (long)self.hingeStatus, NSStringFromCGRect(layout.gameFrame), NSStringFromCGRect(layout.padFrame)];
+    if (![line isEqualToString:self.layoutLog]) { self.layoutLog = line; LOG("front end: layout %s", line.UTF8String); }
     CGRect controlsSafe = CGRectIntersection(layout.padFrame, UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets));
     if (CGRectIsNull(controlsSafe) || CGRectIsInfinite(controlsSafe) || CGRectIsEmpty(controlsSafe))
         controlsSafe = CGRectIsEmpty(layout.padFrame) || CGRectIsNull(layout.padFrame) ? CGRectZero : layout.padFrame;
@@ -316,6 +403,10 @@ static void launcher_done(void) { [g_root startGame]; }
         self.fps.frame = CGRectMake(floor(x), floor(y), 64, 22);
     }
 }
+- (void)showFPS:(BOOL)on {   // the frame-rate counter: DM_SHOW_FPS at Play, then the in-game menu
+    if (on && !self.fps) { self.fps = front_ios_fps_label(); [self.view addSubview:self.fps]; [self.view setNeedsLayout]; }   // above the pad, which hides while a controller is connected
+    self.fps.hidden = !on;
+}
 - (void)viewDidAppear:(BOOL)a {
     [super viewDidAppear:a];
     [self.view setNeedsLayout]; [self.view layoutIfNeeded];
@@ -331,9 +422,78 @@ static void launcher_done(void) { [g_root startGame]; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }   // Edge gestures need two swipes, to avoid accidental exits
 - (BOOL)prefersStatusBarHidden { return YES; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAllButUpsideDown; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
 @end
 UIViewController *front_ios_root(void) { return [DmRootVC new]; }
+
+// A TV (cable or AirPlay): iOS gives the app the TV as a scene of its own instead of mirroring the phone. The game's view moves there, 16:9 fills the TV, and the game is
+// docked as a Switch on its dock (1080p, the operation mode change notification); the phone keeps the pad. Unplugging puts the view back and the mode the game had before
+@interface DmTVVC : UIViewController
+@end
+@implementation DmTVVC
+- (void)viewDidLoad { [super viewDidLoad]; self.view.backgroundColor = UIColor.blackColor; }
+- (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; for (UIView *v in self.view.subviews) v.frame = dm_aspect_fit(self.view.bounds); }
+@end
+static void tv_attach(void) {
+    DmGameView *v = g_root.game; if (!g_tv || !v || v.superview == g_tv.rootViewController.view) return;
+    // Restore the picture from its reflection container before the TV takes
+    // ownership, and cancel a draft whose pad geometry is about to change.
+    if (dm_gamepad_is_layout_editing(g_root.pad)) dm_gamepad_end_layout_edit(g_root.pad, NO);
+    dm_gamepad_release_touches(g_root.pad);
+    [g_root.controlReflection disable];
+    // at most 1080p: the game renders 1080p docked, and a 4K drawable only adds an upscale and a 4K stream (an AirPlay TV showed black, the GPU went from 15 to 60 ms a frame).
+    // Taken from the 16:9 picture, not the screen, so a display of another shape still gets the full 1920 pixels across the picture (DmGameView layoutSubviews applies it)
+    v.maxPixelWidth = 1920;
+    [g_tv.rootViewController.view addSubview:v]; [g_tv.rootViewController.view setNeedsLayout]; [g_root.view setNeedsLayout];   // the phone's pad takes the whole screen
+    CGRect f = dm_aspect_fit(g_tv.bounds); CGFloat scale = MIN(g_tv.windowScene.screen.nativeScale, 1920.0 / MAX(f.size.width, 1));
+    if (g_tv_mode_was < 0) g_tv_mode_was = dm_opmode();
+    dm_set_opmode(1); dm_gamepad_opmode_changed();
+    LOG("front end: TV connected (%.0fx%.0f points), the picture moves there at %.0fx%.0f, console mode", g_tv.bounds.size.width, g_tv.bounds.size.height, f.size.width * scale, f.size.height * scale);
+}
+static void tv_detach(void) {
+    DmGameView *v = g_root.game;
+    if (dm_gamepad_is_layout_editing(g_root.pad)) dm_gamepad_end_layout_edit(g_root.pad, NO);
+    dm_gamepad_release_touches(g_root.pad);
+    [g_root.controlReflection disable];
+    g_tv = nil; v.maxPixelWidth = 0;
+    if (v && v.superview != g_root.view) { [g_root.view insertSubview:v atIndex:0]; [g_root.view setNeedsLayout]; }
+    if (g_tv_mode_was >= 0) { dm_set_opmode(g_tv_mode_was); g_tv_mode_was = -1; dm_gamepad_opmode_changed(); }
+    LOG("front end: TV disconnected, the picture is back on the phone");
+}
+
+// The settings the in-game menu offers (GameMenu.swift, from the gamepad's menu button), each taking effect while the game runs; the launcher's other settings need the next start.
+// value NULL: only whether env is one of them; otherwise apply it (GameMenu.swift has saved it and put it in the environment). Console mode changes as on a Switch put in or taken out of its
+// dock (the operation mode change notification); while a TV shows the picture the game stays docked, and the choice applies when the TV is unplugged
+bool dm_setting_live(const char *env, const char *value) {
+    if (!env || !g_root.game) return false;
+    if (!strcmp(env, "DM_PICTURE_FIT")) {
+        if (value) { g_root.fill = dm_picture_fill(value); [g_root.view setNeedsLayout]; LOG("front end: picture %s (in-game menu)", g_root.fill ? "Fill" : "Fit"); }
+        return true;
+    }
+    if (!strcmp(env, "DM_OPMODE")) {
+        if (!value) return true;
+        int m = atoi(value) ? 1 : 0;
+        if (g_tv_mode_was >= 0) { g_tv_mode_was = m; LOG("front end: console mode %s once the TV is unplugged (in-game menu)", m ? "docked" : "handheld"); return true; }
+        dm_set_opmode(m); dm_gamepad_opmode_changed(); LOG("front end: console mode %s (in-game menu)", m ? "docked" : "handheld");
+        return true;
+    }
+    if (!strcmp(env, "DM_SHOW_FPS")) { if (value) [g_root showFPS:atoi(value) != 0]; return true; }
+    if (!strcmp(env, "DM_TOUCH_HAPTICS")) { if (value) dm_gamepad_touch_feedback(atoi(value) != 0); return true; }
+    if (!strcmp(env, "DM_RUMBLE")) { if (value) { dm_haptics_set_enabled(atoi(value) != 0); LOG("front end: game rumble %s (in-game menu)", atoi(value) ? "on" : "off"); } return true; }
+    return false;
+}
+@interface DmTVSceneDelegate : UIResponder <UIWindowSceneDelegate>
+@property (strong, nonatomic) UIWindow *window;
+@end
+@implementation DmTVSceneDelegate
+- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)o {
+    self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
+    self.window.rootViewController = [DmTVVC new];
+    self.window.hidden = NO;   // without a window iOS goes on mirroring the phone; not key, so the phone's window keeps the keyboard
+    g_tv = self.window; tv_attach();
+}
+- (void)sceneDidDisconnect:(UIScene *)s { if (g_tv == self.window) tv_detach(); self.window = nil; }
+@end
 
 // Thermal state and screen brightness for the power and present rows every 300 frames (hle_nvn.c; its weak defaults return -1 on the Mac). thermalState: 0 nominal, 1 fair, 2 serious, 3 critical.
 // Brightness is read on the main thread at start and on each change; every change of the thermal state and of Low Power Mode (which lowers the CPU clock) is logged with the time since launch
@@ -355,11 +515,10 @@ static void front_ios_power_watch(void) {
 }
 
 // Frame-rate counter: the frames put on screen in the last second (nvn_mtl.m counts them for NVN and for the Vulkan layer alike; frames the display link merged away are not counted).
-// On when the IPA was built with it (the NSP script's SHOW_FPS / --show-fps → DMShowFPS in Info.plist); DM_SHOW_FPS=0 / 1 in Documents/env.txt overrides that without a rebuild. NULL when off
+// On when the IPA was built with it (the NSP script's SHOW_FPS / --show-fps → DMShowFPS in Info.plist); DM_SHOW_FPS=0 / 1 (the launcher, Documents/env.txt) overrides that without a rebuild,
+// and the in-game menu turns it on and off ([DmRootVC showFPS:])
 uint64_t mtl_present_count(void);
 static UILabel *front_ios_fps_label(void) {
-    const char *e = getenv("DM_SHOW_FPS");
-    if (!(e ? atoi(e) != 0 : [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMShowFPS"] boolValue])) return nil;
     UILabel *l = [UILabel new];
     l.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold]; l.textColor = UIColor.whiteColor; l.textAlignment = NSTextAlignmentCenter;
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45]; l.layer.cornerRadius = 6; l.layer.masksToBounds = YES; l.userInteractionEnabled = NO;
@@ -376,9 +535,12 @@ static UILabel *front_ios_fps_label(void) {
 
 // Progress screen of the prepare step (front.h front_progress): a dark view over the game's view and the pad, the title, a bar and a count, centered; UIKit views, so it draws while the game's thread waits
 static UIView *g_prog; static UILabel *g_prog_count; static UIProgressView *g_prog_bar; static UILabel *g_prog_title;
+void (*front_progress_hook)(const char *title, long done, long total);
 void front_progress(const char *title, long done, long total) {
     if (!g_layer) return;
     NSString *tt = title ? @(title) : nil;
+    void (*hook)(const char *, long, long) = front_progress_hook;
+    if (hook) { dispatch_async(dispatch_get_main_queue(), ^{ hook(tt.UTF8String, done, total); }); return; }   // the host app draws it (front.h)
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!tt) { [g_prog removeFromSuperview]; g_prog = nil; return; }
         if (!g_prog) {

@@ -7,6 +7,9 @@ func launcherText(_ source: String) -> String {
 #if os(iOS)
     let translations: [String: String] = [
         "Game": "游戏", "Controls": "控制", "Performance": "性能",
+        "Picture": "画面适配", "Fit": "完整显示", "Fill": "铺满（裁切）",
+        "Game's upscaler": "游戏画面放大器", "Game's own": "游戏自带",
+        "Fill crops the game's 16:9 picture to cover the screen. Health bars, subtitles or maps near the edges can be cut off. A full-screen picture without cropping needs a patch for each game.": "铺满会裁切 16:9 画面的边缘，血条、字幕或地图可能被截断。若要全屏且不裁切，需要针对游戏制作补丁。",
         "Frame rate": "目标帧率", "30 fps": "30 帧/秒", "60 fps": "60 帧/秒",
         "Dynamic resolution": "动态分辨率", "Render scale": "渲染比例",
         "Console mode": "主机模式", "Docked": "底座模式", "Handheld": "掌机模式",

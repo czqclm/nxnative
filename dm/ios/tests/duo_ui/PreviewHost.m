@@ -17,6 +17,8 @@
 UIViewController *front_ios_root(void);
 void front_ios_focus_event(int event);
 uint64_t g_t0_ns;
+// Upstream host-work guards are inert in this UI-only executable.
+__thread _Atomic int dm_host_work;
 static pthread_mutex_t inputLock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t buttons;
 static int32_t axes[4];
@@ -124,6 +126,7 @@ BOOL dm_preview_inject_accelerometer(NSTimeInterval timestamp, double x, double 
 uint64_t now_ns(void) { return (uint64_t)(CACurrentMediaTime() * 1000000000.0); }
 int front_ios_boot_ok(void) { return 1; }
 const char *front_ios_boot_message(void) { return NULL; }
+const char *front_ios_device_check(void) { return NULL; }   // The synthetic picture needs no game GPU features.
 uint64_t mtl_present_count(void) { return 0; }
 void dm_input_set(uint64_t b, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     pthread_mutex_lock(&inputLock);
@@ -150,6 +153,7 @@ void dm_pad_players(uint32_t mask) { (void)mask; }
 void dm_motion_set(int p, const float a[3], const float r[3]) { (void)p; (void)a; (void)r; }
 void dm_motion_set_switch(int p, const float a[3], const float r[3]) { (void)p; (void)a; (void)r; }
 void dm_motion_clear(int p) { (void)p; }
+void dm_haptics_set_enabled(int on) { (void)on; }
 void dm_haptics_apple_init(void) {}
 void dm_haptics_apple_controller(int p, GCController *c) { (void)p; (void)c; }
 void dm_haptics_apple_shutdown(void) {}
@@ -174,6 +178,7 @@ void guest_clock_freeze_for(int reason, int enabled) {
     recordPauseEvent(@"clock", enabled, reason); pthread_mutex_unlock(&inputLock);
 }
 int dm_opmode(void) { const char *value = getenv("DM_OPMODE"); return value ? atoi(value) : 0; }
+void dm_set_opmode(int mode) { setenv("DM_OPMODE", mode ? "1" : "0", 1); }
 
 void dm_preview_start_metal(UIView *view);
 uint64_t dm_preview_metal_frames(void);

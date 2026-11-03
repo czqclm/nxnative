@@ -5,6 +5,9 @@
 NS_ASSUME_NONNULL_BEGIN
 FOUNDATION_EXPORT NSNotificationName const DmGamepadLayoutEditingDidChangeNotification;
 FOUNDATION_EXPORT UIView *dm_gamepad_view(CGRect frame);
+// The root gear can keep its editing action and use this menu on long press.
+FOUNDATION_EXPORT UIButton *dm_game_menu_button(void);
+FOUNDATION_EXPORT void dm_gamepad_set_menu_visible(UIView *pad, BOOL visible);
 FOUNDATION_EXPORT void dm_gamepad_active(void);
 FOUNDATION_EXPORT void dm_gamepad_reset(void);
 FOUNDATION_EXPORT void dm_gamepad_release_touches(UIView *pad);

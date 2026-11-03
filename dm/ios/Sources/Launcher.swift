@@ -27,6 +27,18 @@ private struct CloudSavesSection: View {
                     .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
             Button(folder.isEmpty ? "选择 iCloud 云盘文件夹…" : "选择其他文件夹…") { picking = true }
+                // Attach the picker to one button; a Section forwards modifiers to every row.
+                .sheet(isPresented: $picking) {
+                    DocumentPicker(types: [.folder]) { url in
+                        picking = false
+                        if dm_store_cloud_saves(url) {
+                            note = "已保存。点击“开始游戏”后将使用此文件夹。"
+                            refresh()
+                        } else {
+                            note = "无法记住所选文件夹，请尝试选择其他文件夹。"
+                        }
+                    } onCancel: { picking = false }
+                }
             if !folder.isEmpty {
                 Button("关闭云存档", role: .destructive) {
                     dm_clear_cloud_saves(); refresh(); note = ""
@@ -37,17 +49,7 @@ private struct CloudSavesSection: View {
                  ? "在 iCloud 云盘中选择一个文件夹，并在 Mac 应用的云存档设置中选择同一文件夹。游戏启动时导入云端存档，每次保存后同步到该文件夹；被替换的存档会保留在 save-backups 中。"
                  : note)
         }
-        .sheet(isPresented: $picking) {
-            DocumentPicker(types: [.folder]) { url in
-                picking = false
-                if dm_store_cloud_saves(url) {
-                    note = "已保存。点击“开始游戏”后将使用此文件夹。"
-                    refresh()
-                } else {
-                    note = "无法记住所选文件夹，请尝试选择其他文件夹。"
-                }
-            } onCancel: { picking = false }
-        }
+
         .onAppear(perform: refresh)
     }
 
@@ -209,9 +211,10 @@ private struct LauncherView: View {
 public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @convention(c) () -> Void) -> Bool {
     guard let url = Bundle.main.resourceURL?.appendingPathComponent("dm/launcher.json"), let data = try? Data(contentsOf: url) else { return false }
     guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else { fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr); return false }
-    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); LauncherModel(file.settings).applySaved(); return false }
-    let parent = Unmanaged<UIViewController>.fromOpaque(viewController).takeUnretainedValue()
     let model = LauncherModel(file.settings)
+    gameMenuModel = model   // the in-game menu shows and saves the same choices (GameMenu.swift)
+    if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); model.applySaved(); return false }
+    let parent = Unmanaged<UIViewController>.fromOpaque(viewController).takeUnretainedValue()
     var host: UIViewController?
     let view = LauncherView(m: model) {
         guard let h = host else { return }
@@ -219,7 +222,7 @@ public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @c
         model.apply()
         h.dismiss(animated: false) { done() }
     }
-    let h = UIHostingController(rootView: view)
+    let h = DmHostingController(rootView: view)
     h.modalPresentationStyle = .fullScreen
     host = h
     parent.present(h, animated: false)
