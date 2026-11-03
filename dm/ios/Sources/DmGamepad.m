@@ -1,6 +1,7 @@
 // Virtual gamepad and physical controllers, publishing through dm_input_set / dm_pad_set_player.
-// Touch profiles (outer, inner, folded) keep normalized positions, per-control scales and stick curves.
-// Standard outer/inner layouts retain their own 2D/3D/Tap choices; folded uses full 3D controls.
+// Stored keys stay compatible: outer, inner (inner landscape), folded (inner portrait).
+// They keep positions, scales and stick curves. Inner portrait uses full 3D controls;
+// the other profiles retain their own 2D/3D/Tap choices.
 // Both sticks are visible fixed-center controls. Touch ownership stays with a control until release.
 // Live layout drafts reuse this exact view without changing its coordinate system or publishing touch input.
 // Isolated test previews additionally skip all sensor and controller initialization.

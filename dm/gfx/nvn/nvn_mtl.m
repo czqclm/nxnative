@@ -3,6 +3,10 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CAMetalDisplayLink.h>
 #import <MetalFX/MetalFX.h>
+#if TARGET_OS_IOS
+// Optional iOS control-area effect. The game image and presentation policy stay owned here.
+extern void dm_control_reflection_capture_m4(id<MTL4CommandQueue> queue, id<MTLTexture> source) __attribute__((weak_import));
+#endif
 #undef I   // MetalFX brings in <complex.h>, whose I (the imaginary unit) would shadow the local tables named I below
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
@@ -11197,6 +11201,10 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     id<MTL4CommandBuffer> buffers[] = {cb};
     pthread_mutex_lock(&g_pq_mu); g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
     [g_q4 commit:buffers count:1 options:o];
+#if TARGET_OS_IOS
+    // Copy the finished display texture before it can be presented/reused.
+    if (dm_control_reflection_capture_m4) dm_control_reflection_capture_m4(g_q4, dr.texture);
+#endif
     if (target_ts > 0) {
         static double leads[300], e2e[300];   // e2e: game enqueue -> system-scheduled present (including the time waiting in the queue for the display-link callback), the full span of input latency that our side can read
         static uint64_t lead_n;

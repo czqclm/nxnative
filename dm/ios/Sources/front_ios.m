@@ -1,5 +1,5 @@
-// iOS front end: an aspect-fit 16:9 Metal view and a virtual gamepad. Duo's
-// reserved division region separates the picture and controls when folded.
+// iOS front end: an aspect-fit 16:9 Metal view and a virtual gamepad.
+// Portrait places controls below the picture; landscape keeps the full overlay.
 // The host runs on the big-stack thread started by main.m; front_run runs the guest directly on the calling thread.
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -9,6 +9,10 @@
 #import "DmTouchConfig.h"
 #import "DmGamepad.h"
 #import "DmLiveTouchEditor.h"
+#import "DmControlReflection.h"
+#import "DmReflectionStyle.h"
+#import "DmReflectionPreferences.h"
+#include <math.h>
 #include <errno.h>
 #include "front.h"
 #include "hle.h"
@@ -63,6 +67,8 @@ static int g_audio_bg, g_audio_intr, g_layout_editing, g_scene_active = 1, g_gra
 
 @interface DmRootVC : UIViewController
 @property (nonatomic, strong) DmGameView *game;
+@property (nonatomic, strong) DmControlReflection *controlReflection;
+@property (nonatomic, strong) DmReflectionPreferences *reflectionPreferences;
 @property (nonatomic, strong) UIView *pad;
 @property (nonatomic, strong) UILabel *fps;
 @property (nonatomic, strong) UIButton *layoutButton;
@@ -71,9 +77,11 @@ static int g_audio_bg, g_audio_intr, g_layout_editing, g_scene_active = 1, g_gra
 @property (nonatomic) BOOL launched;
 @property (nonatomic, strong) id<UIInteraction> hingeInteraction;
 @property (nonatomic) NSInteger lastHingeStatus;
+@property (nonatomic) CGFloat lastHingeAngle;
 @property (nonatomic) DmDuoGeometry displayGeometry;
 @property (nonatomic) BOOL hasDisplayGeometry;
 - (void)startGame;
+- (void)updateHingeStatus:(NSInteger)status angle:(CGFloat)angleRadians;
 @end
 static DmRootVC *g_root;
 static void launcher_done(void) { [g_root startGame]; }
@@ -81,28 +89,26 @@ static void launcher_done(void) { [g_root startGame]; }
 - (void)viewDidLoad {
     [super viewDidLoad];
     g_root = self;
+    self.reflectionPreferences = [DmReflectionPreferences new];
     self.view.backgroundColor = UIColor.blackColor;
     // Observe before presenting Launcher: its profile picker must follow the
     // current display even before the Metal view or gamepad has been created.
     self.lastHingeStatus = -1;
+    self.lastHingeAngle = NAN;
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(touchSettingsChanged:)
         name:DmTouchSettingsDidChangeNotification object:nil];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(layoutEditingChanged:)
         name:DmGamepadLayoutEditingDidChangeNotification object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(controlReflectionChanged:)
+        name:DmControlReflectionDidChangeNotification object:nil];
     if (@available(iOS 27.1, *)) {
         __weak DmRootVC *weakSelf = self;
         self.hingeInteraction = [[UIHingeInteraction alloc] initWithUpdateHandler:
             ^(UIHingeInteraction *interaction, UIHingeInteractionUpdate *update) {
                 (void)interaction;
                 DmRootVC *self = weakSelf; if (!self) return;
-                NSInteger status = update.hinge ? update.hinge.status : -1;
-                if (status != self.lastHingeStatus) {
-                    self.lastHingeStatus = status;
-                    LOG("front end: hinge status %ld", (long)status);
-                    if (self.pad) dm_gamepad_release_touches(self.pad);
-                }
-                // Region geometry, not a guessed angle threshold, decides layout.
-                [self.view setNeedsLayout];
+                UIHinge *hinge = update.hinge;
+                [self updateHingeStatus:hinge ? hinge.status : -1 angle:hinge ? hinge.angle : NAN];
             }];
         [self.view addInteraction:self.hingeInteraction];
     }
@@ -125,15 +131,39 @@ static void launcher_done(void) { [g_root startGame]; }
     front_ios_audio_watch();
 }
 - (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
+- (void)updateHingeStatus:(NSInteger)status angle:(CGFloat)angleRadians {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self updateHingeStatus:status angle:angleRadians]; });
+        return;
+    }
+    if (status != self.lastHingeStatus) LOG("front end: hinge status %ld", (long)status);
+    self.lastHingeStatus = status;
+    // Angles can change without a status transition. Nil/invalid updates clear
+    // the usable angle instead of retaining a stale bent-screen reflection.
+    self.lastHingeAngle = isfinite(angleRadians) ? angleRadians : NAN;
+    // A visual update must not publish touch settings, release held input,
+    // discard an editor draft, or change either owner of the game's pause.
+    [self.view setNeedsLayout];
+}
 - (void)touchSettingsChanged:(NSNotification *)notification {
     (void)notification;
     if (self.pad) dm_gamepad_release_touches(self.pad);
     [self.view setNeedsLayout];
 }
+- (void)controlReflectionChanged:(NSNotification *)notification {
+    (void)notification;
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self.view setNeedsLayout]; });
+        return;
+    }
+    // A visual preference must not release held input, discard an editor draft,
+    // or change either owner of the graphics/audio/guest-clock pause.
+    [self.view setNeedsLayout];
+}
 - (void)beginLayoutEditing {
     if (!self.pad || self.layoutEditor || dm_gamepad_is_layout_editing(self.pad)) return;
     if (dm_gamepad_begin_layout_edit(self.pad)) {
-        self.layoutEditor = [[DmLiveTouchEditor alloc] initWithPad:self.pad];
+        self.layoutEditor = [[DmLiveTouchEditor alloc] initWithPad:self.pad reflectionPreferences:self.reflectionPreferences];
         [self addChildViewController:self.layoutEditor];
         self.layoutEditor.view.frame = self.view.bounds;
         self.layoutEditor.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -146,6 +176,10 @@ static void launcher_done(void) { [g_root startGame]; }
 - (void)layoutEditingChanged:(NSNotification *)notification {
     if (notification.object != self.pad) return;
     BOOL editing = [notification.userInfo[@"editing"] boolValue];
+    // The pad decides whether Save was accepted. Geometry/profile cancellation
+    // must roll back the visual draft too, before gameplay is resumed.
+    if (editing) [self.reflectionPreferences beginEditing];
+    else [self.reflectionPreferences endEditingSaving:[notification.userInfo[@"reason"] isEqualToString:@"saved"]];
     front_ios_set_layout_editing(editing);
     if (editing) return;
     [self.layoutEditor willMoveToParentViewController:nil];
@@ -157,7 +191,7 @@ static void launcher_done(void) { [g_root startGame]; }
     if ([reason isEqualToString:@"profileChanged"] || [reason isEqualToString:@"geometryChanged"]) {
         [self.layoutNotice removeFromSuperview];
         UILabel *notice = [UILabel new];
-        notice.text = @"屏幕形态已变化，未保存的布局修改已取消";
+        notice.text = @"屏幕形态已变化，未保存的设置修改已取消";
         notice.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
         notice.textColor = UIColor.whiteColor; notice.textAlignment = NSTextAlignmentCenter;
         notice.numberOfLines = 2; notice.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.94];
@@ -187,6 +221,7 @@ static void launcher_done(void) { [g_root startGame]; }
     front_hud_env();   // before the game view makes its device (an env file's DM_METAL_HUD sets it in main.m already)
     self.game = [[DmGameView alloc] initWithFrame:self.view.bounds];
     [self.view addSubview:self.game];
+    self.controlReflection = [[DmControlReflection alloc] initWithRootView:self.view gameView:self.game];
     g_layer = (CAMetalLayer *)self.game.layer;
     if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) { g_layer.developerHUDProperties = @{@"mode": @"default"}; LOG("front end: Metal performance HUD on (DM_METAL_HUD)"); }   // Apple's HUD over the game: frame rate, frame and GPU time, memory
     dm_haptics_apple_init();
@@ -231,26 +266,12 @@ static void launcher_done(void) { [g_root startGame]; }
 }
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    CGRect b = self.view.bounds, division = CGRectNull;
+    CGRect b = self.view.bounds;
     UIScreen *currentScreen = self.view.window.windowScene.screen;
     if (currentScreen) g_brightness = currentScreen.brightness;
-    BOOL hasDivision = NO, activeDivision = NO;
-    if (@available(iOS 27.1, *)) {
-        NSArray<UIViewReservedRegion *> *regions = [self.view
-            reservedRegionsOfKind:UIViewReservedRegionKind.divisionRegionKind
-            options:UIViewReservedRegionQueryOptionsIncludeInactive];
-        hasDivision = regions.count > 0;
-        for (UIViewReservedRegion *region in regions) {
-            if (region.isActive && !CGRectIsEmpty(CGRectIntersection(b, region.frame))) {
-                activeDivision = YES; division = region.frame; break;
-            }
-        }
-    }
     NSString *mode = [NSUserDefaults.standardUserDefaults stringForKey:@"DmTouchDisplayMode"];
-    NSString *profile = dm_duo_resolve_profile(mode, hasDivision, activeDivision,
-        self.traitCollection.horizontalSizeClass, self.traitCollection.verticalSizeClass);
-    DmDuoGeometry layout = dm_duo_geometry(b, self.view.safeAreaInsets,
-        [profile isEqualToString:@"folded"], division, activeDivision);
+    NSString *profile;
+    DmDuoGeometry layout = dm_duo_layout_for_view(self.view, mode, &profile);
     BOOL geometryChanged = !self.hasDisplayGeometry
         || !CGRectEqualToRect(layout.gameFrame, self.displayGeometry.gameFrame)
         || !CGRectEqualToRect(layout.padFrame, self.displayGeometry.padFrame)
@@ -262,7 +283,12 @@ static void launcher_done(void) { [g_root startGame]; }
         dm_duo_publish_layout(profile, layout);
     }
     if (!self.game) return;
-    self.game.frame = layout.gameFrame;
+    BOOL partiallyOpen = NO;
+    if (@available(iOS 27.1, *)) partiallyOpen = self.lastHingeStatus == UIHingeStatusPartiallyOpen;
+    DmReflectionStyle reflectionStyle = dm_reflection_configured_style(self.reflectionPreferences.currentSettings,
+        layout.split && [profile isEqualToString:@"folded"], partiallyOpen, self.lastHingeAngle);
+    [self.controlReflection updateWithBounds:b gameFrame:layout.gameFrame controlFrame:layout.padFrame
+                                      style:reflectionStyle];
     [self.game setNeedsLayout];   // The scene's display scale can change without a bounds change.
     self.pad.frame = layout.padFrame;
     dm_gamepad_set_game_rect(self.pad, layout.gameFrame);

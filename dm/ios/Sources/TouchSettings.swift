@@ -3,20 +3,25 @@ import SwiftUI
 import UIKit
 
 struct DuoDisplaySection: View {
-    @State private var mode = UserDefaults.standard.string(forKey: "DmTouchDisplayMode") ?? "automatic"
+    @AppStorage("DmControlReflectionEnabled") private var controlReflectionEnabled = true
+    @State private var mode: String = {
+        let saved = UserDefaults.standard.string(forKey: "DmTouchDisplayMode") ?? "automatic"
+        // Keep the stored legacy override intact; both old inner choices now
+        // select the inner screen and let its orientation choose the profile.
+        return saved == "folded" ? "inner" : saved
+    }()
     @State private var active = dm_touch_active_profile()
 
     private var currentName: String {
-        ["outer": "外屏", "inner": "展开内屏", "folded": "折叠双区"][active] ?? "外屏"
+        ["outer": "外屏", "inner": "内屏横屏", "folded": "内屏竖屏"][active] ?? "外屏"
     }
 
     var body: some View {
         Section {
-            Picker("布局模式", selection: $mode) {
+            Picker("屏幕选择", selection: $mode) {
                 Text("自动识别").tag("automatic")
                 Text("外屏").tag("outer")
-                Text("展开内屏").tag("inner")
-                Text("折叠双区").tag("folded")
+                Text("内屏").tag("inner")
             }
             .accessibilityIdentifier("touch.displayMode")
             .onChange(of: mode) { _, value in
@@ -26,11 +31,16 @@ struct DuoDisplaySection: View {
             .onReceive(NotificationCenter.default.publisher(for: .DmTouchSettingsDidChange)) { _ in
                 active = dm_touch_active_profile()
             }
-            LabeledContent("当前形态", value: currentName)
+            LabeledContent("当前布局", value: currentName)
+            Toggle("控制区倒影", isOn: $controlReflectionEnabled)
+                .accessibilityIdentifier("touch.controlReflection")
+                .onChange(of: controlReflectionEnabled) { _, _ in
+                    NotificationCenter.default.post(name: Notification.Name("DmControlReflectionDidChange"), object: nil)
+                }
         } header: {
             Text("iPhone Duo")
         } footer: {
-            Text("进入游戏后，点画面上的 ⚙ 按钮，直接调整当前按键和摇杆。外屏、展开内屏、折叠双区分别保存。")
+            Text("竖屏上方显示画面、下方放置按键；倒影仅在内屏竖屏弯折且角度可用时显示，展开、外屏和横屏不显示。弯折不切换按键布局。内屏竖屏、内屏横屏、外屏分别保存。进入游戏后点 ⚙ 调整。")
         }
     }
 }

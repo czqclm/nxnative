@@ -25,8 +25,8 @@
 }
 
 static NSString *profile_title(NSString *profile) {
-    if ([profile isEqualToString:@"inner"]) return @"展开内屏";
-    if ([profile isEqualToString:@"folded"]) return @"折叠双区";
+    if ([profile isEqualToString:@"inner"]) return @"内屏横屏";
+    if ([profile isEqualToString:@"folded"]) return @"内屏竖屏";
     return @"外屏";
 }
 
@@ -202,31 +202,15 @@ static NSString *control_title(NSString *control) {
     _canvas.frame = CGRectMake(safe.origin.x + margin, canvasTop, width, MAX(1, bottomTop - canvasTop - 8));
 
     // The pad's geometry is calculated at the runtime size before the whole preview is fitted.
-    CGRect referenceFrame = bounds;
-    UIEdgeInsets referenceInsets = insets;
-    if ([_profile isEqualToString:@"folded"]) {
-        CGRect division = CGRectNull;
-        BOOL activeDivision = NO;
-        if (@available(iOS 27.1, *)) {
-            NSArray<UIViewReservedRegion *> *regions = [self.view
-                reservedRegionsOfKind:UIViewReservedRegionKind.divisionRegionKind
-                options:UIViewReservedRegionQueryOptionsIncludeInactive];
-            for (UIViewReservedRegion *region in regions) {
-                if (region.isActive && !CGRectIsEmpty(CGRectIntersection(bounds, region.frame))) {
-                    division = region.frame; activeDivision = YES; break;
-                }
-            }
-        }
-        // Follow the production top/bottom split and its usable horizontal division.
-        // With no usable active division the geometry helper supplies the manual fallback.
-        CGRect pad = dm_duo_geometry(bounds, insets, YES, division, activeDivision).padFrame;
-        referenceFrame = pad;
-        // Only the real outside edges inherit a safe inset; the division edge is interior.
-        referenceInsets = UIEdgeInsetsMake(fabs(CGRectGetMinY(pad) - CGRectGetMinY(bounds)) < 1 ? insets.top : 0,
-                                          fabs(CGRectGetMinX(pad) - CGRectGetMinX(bounds)) < 1 ? insets.left : 0,
-                                          fabs(CGRectGetMaxY(pad) - CGRectGetMaxY(bounds)) < 1 ? insets.bottom : 0,
-                                          fabs(CGRectGetMaxX(pad) - CGRectGetMaxX(bounds)) < 1 ? insets.right : 0);
-    }
+    NSString *resolvedProfile;
+    CGRect pad = dm_duo_layout_for_view(self.view, _profile, &resolvedProfile).padFrame;
+    CGRect referenceFrame = pad;
+    // Only the real outside edges inherit a safe inset; the division edge is interior.
+    UIEdgeInsets referenceInsets = UIEdgeInsetsMake(
+        fabs(CGRectGetMinY(pad) - CGRectGetMinY(bounds)) < 1 ? insets.top : 0,
+        fabs(CGRectGetMinX(pad) - CGRectGetMinX(bounds)) < 1 ? insets.left : 0,
+        fabs(CGRectGetMaxY(pad) - CGRectGetMaxY(bounds)) < 1 ? insets.bottom : 0,
+        fabs(CGRectGetMaxX(pad) - CGRectGetMaxX(bounds)) < 1 ? insets.right : 0);
     if (!_hasReferenceGeometry || !CGRectEqualToRect(_referenceFrame, referenceFrame) ||
         !UIEdgeInsetsEqualToEdgeInsets(_referenceInsets, referenceInsets)) {
         [self releaseEditingTouches];

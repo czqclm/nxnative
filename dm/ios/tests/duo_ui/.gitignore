@@ -1,0 +1,10 @@
+# XcodeGen and Xcode output; keep only portable harness sources.
+/*.xcodeproj/
+/Info.plist
+/DerivedData/
+/*.xcresult/
+/*.xcarchive/
+/*.app/
+/*.ipa
+/*.log
+/.DS_Store

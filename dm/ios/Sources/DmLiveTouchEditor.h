@@ -4,9 +4,13 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+@class DmReflectionPreferences;
+
 @interface DmLiveTouchEditor : UIViewController
 // The owner begins runtime editing first, pauses the game and attaches this child.
-- (instancetype)initWithPad:(UIView *)pad NS_DESIGNATED_INITIALIZER;
+- (instancetype)initWithPad:(UIView *)pad;
+- (instancetype)initWithPad:(UIView *)pad
+     reflectionPreferences:(nullable DmReflectionPreferences *)preferences NS_DESIGNATED_INITIALIZER;
 - (instancetype)initWithNibName:(nullable NSString *)name bundle:(nullable NSBundle *)bundle NS_UNAVAILABLE;
 - (instancetype)initWithCoder:(NSCoder *)coder NS_UNAVAILABLE;
 // All rectangles use the root view's coordinates. The owner supplies view.frame.
